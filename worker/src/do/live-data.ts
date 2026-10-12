@@ -72,6 +72,19 @@ const POLICY_SETTING_CACHE_MS = 30_000;
 const PING_TASK_CACHE_MS = 120_000;
 const WEBSITE_PROBE_TASK_CACHE_MS = 120_000;
 const AGENT_POLICY_OPTIONAL_ERROR_THROTTLE_MS = 5 * 60 * 1000;
+// Idle agents all received the same interval, so a fleet deployed on a single
+// day locked phases and reported within the same second. That burst saturated
+// the shared database pool, and the slowest acknowledgement in the burst
+// crossed the agent's 90s deadline: the socket dropped and the node flashed
+// offline. Each node now gets its own whole-second slot, derived from the
+// managed roster, so the phases drift apart after the first round.
+// A pure hash offset was not enough: by chance two nodes could land on the same
+// second, and two nodes with an identical interval never separate again.
+// Idle slots are centered on the configured cadence, so the fleet average load
+// is unchanged, and the active window is capped to keep the live view live.
+const AGENT_IDLE_INTERVAL_SPREAD_RATIO = 0.3;
+const AGENT_IDLE_INTERVAL_SPREAD_MAX_SEC = 120;
+const AGENT_ACTIVE_INTERVAL_SPREAD_MAX_SEC = 5;
 const RECORD_CAPACITY_SNAPSHOT_KEY = 'record:capacity:snapshot';
 const AGENT_POLICY_SETTING_KEYS = [
   'live_poll_active_interval_sec',
@@ -1093,9 +1106,12 @@ export class LiveDataDO {
     }
   }
 
-  private pingTasksForClient(tasks: db.PingTask[], clientId?: string): db.PingTask[] {
+  private pingTasksForClient(
+    tasks: db.PingTask[],
+    clientId: string | undefined,
+    intervalSec: number,
+  ): db.PingTask[] {
     if (!clientId) return [];
-    const intervalSec = this.policySettings.pingIntervalSec;
     return tasks
       .filter(task => task.all_clients || task.clients.includes(clientId))
       .map(task => ({ ...task, interval_sec: intervalSec }));
@@ -1205,6 +1221,40 @@ export class LiveDataDO {
     return this.trafficResetDays.get(clientId);
   }
 
+  // Position the node inside the managed roster. The order is sorted by id, so a
+  // node keeps its slot across policy refreshes and restarts — that stability is
+  // what lets the phases keep drifting instead of snapping back together.
+  private intervalSpreadSlot(clientId: string | undefined): { index: number; total: number } {
+    if (!clientId) return { index: 0, total: 0 };
+    const ids = (this.adminClientsSnapshot?.clients || [])
+      .map(client => String(client.uuid || ''))
+      .filter(uuid => uuid !== '')
+      .sort();
+    const index = ids.indexOf(clientId);
+    return index < 0 ? { index: 0, total: 0 } : { index, total: ids.length };
+  }
+
+  // Give every node its own whole second while the roster is small enough; once
+  // the fleet outgrows the window, fall back to a proportional spread.
+  private intervalSpreadWindowSec(total: number, softSec: number, hardSec: number): number {
+    if (total <= 1) return 0;
+    return Math.min(Math.max(total, Math.floor(softSec)), hardSec);
+  }
+
+  // Centered so the fleet average interval is unchanged and no node is pushed
+  // far from the configured cadence; only the phase differs between nodes.
+  // The active window is one-directional: its 3s base is already the agent's
+  // floor, so a negative offset would collapse below the minimum cadence.
+  private intervalSpreadSec(
+    slot: { index: number; total: number },
+    windowSec: number,
+    centered: boolean,
+  ): number {
+    if (slot.total <= 1 || windowSec <= 0) return 0;
+    const span = Math.floor((windowSec * slot.index) / slot.total);
+    return centered ? span - Math.floor(windowSec / 2) : span;
+  }
+
   private async buildAgentPolicy(
     now: number,
     reportNow: boolean,
@@ -1214,13 +1264,32 @@ export class LiveDataDO {
     const settings = await this.getAgentPolicySettings(now, forceRefreshSettings);
     const viewerCount = this.activeViewerCount(now);
     const mode: AgentPolicyMode = viewerCount > 0 ? 'active' : 'idle';
-    const pingTasks = this.pingTasksForClient(await this.getPingTasks(now), clientId);
+    // Desynchronize the fleet: every agent used to receive the identical
+    // interval, so all nodes reported inside the same second and the shared
+    // database burst pushed the last acknowledgement past the agent deadline.
+    if (!this.adminClientsSnapshot) await this.readAdminClientsSnapshot();
+    const slot = this.intervalSpreadSlot(clientId);
+    const reportBaseSec = mode === 'active' ? settings.activeIntervalSec : settings.idleIntervalSec;
+    const pingBaseSec = this.policySettings.pingIntervalSec;
+    const reportIntervalSec = reportBaseSec + this.intervalSpreadSec(slot, this.intervalSpreadWindowSec(
+      slot.total,
+      reportBaseSec * AGENT_IDLE_INTERVAL_SPREAD_RATIO,
+      mode === 'active' ? AGENT_ACTIVE_INTERVAL_SPREAD_MAX_SEC : AGENT_IDLE_INTERVAL_SPREAD_MAX_SEC,
+    ), mode !== 'active');
+    // Ping tasks inherit the same slot, so a fleet-wide identical interval can
+    // never make every node probe and persist on the same tick.
+    const pingIntervalSec = pingBaseSec + this.intervalSpreadSec(slot, this.intervalSpreadWindowSec(
+      slot.total,
+      pingBaseSec * AGENT_IDLE_INTERVAL_SPREAD_RATIO,
+      AGENT_IDLE_INTERVAL_SPREAD_MAX_SEC,
+    ), true);
+    const pingTasks = this.pingTasksForClient(await this.getPingTasks(now), clientId, pingIntervalSec);
     const websiteProbeTasks = await this.getWebsiteProbeTasks(now, clientId);
     return {
       type: 'policy',
       mode,
-      sample_interval_sec: mode === 'active' ? settings.activeIntervalSec : settings.idleIntervalSec,
-      report_interval_sec: mode === 'active' ? settings.activeIntervalSec : settings.idleIntervalSec,
+      sample_interval_sec: reportIntervalSec,
+      report_interval_sec: reportIntervalSec,
       report_now: mode === 'active' && reportNow,
       viewer_count: viewerCount,
       viewer_ttl_sec: settings.viewerTtlSec,
