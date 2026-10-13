@@ -80,8 +80,13 @@ const AGENT_POLICY_OPTIONAL_ERROR_THROTTLE_MS = 5 * 60 * 1000;
 // managed roster, so the phases drift apart after the first round.
 // A pure hash offset was not enough: by chance two nodes could land on the same
 // second, and two nodes with an identical interval never separate again.
-// Idle slots are centered on the configured cadence, so the fleet average load
-// is unchanged, and the active window is capped to keep the live view live.
+// Offsets only ever extend the interval. A centered window was tried first and
+// reverted: any slot shorter than the record-persist throttle (120s minus its
+// 5% early tolerance) has every other sample rejected, stretching the stored
+// last_time to twice the cadence and tripping the offline heuristics this
+// change exists to avoid. Extending still separates the phases, and the fleet
+// average load only drops. The active window stays capped so the live view
+// keeps refreshing.
 const AGENT_IDLE_INTERVAL_SPREAD_RATIO = 0.3;
 const AGENT_IDLE_INTERVAL_SPREAD_MAX_SEC = 120;
 const AGENT_ACTIVE_INTERVAL_SPREAD_MAX_SEC = 5;
@@ -1241,18 +1246,17 @@ export class LiveDataDO {
     return Math.min(Math.max(total, Math.floor(softSec)), hardSec);
   }
 
-  // Centered so the fleet average interval is unchanged and no node is pushed
-  // far from the configured cadence; only the phase differs between nodes.
-  // The active window is one-directional: its 3s base is already the agent's
-  // floor, so a negative offset would collapse below the minimum cadence.
+  // One-directional on purpose: the interval must never fall below the
+  // configured cadence, because the record-persist throttle drops any sample
+  // arriving earlier than 120s minus its tolerance. Only the phase needs to
+  // differ between nodes, and a strictly extending interval achieves that
+  // without ever undershooting the throttle.
   private intervalSpreadSec(
     slot: { index: number; total: number },
     windowSec: number,
-    centered: boolean,
   ): number {
     if (slot.total <= 1 || windowSec <= 0) return 0;
-    const span = Math.floor((windowSec * slot.index) / slot.total);
-    return centered ? span - Math.floor(windowSec / 2) : span;
+    return Math.floor((windowSec * slot.index) / slot.total);
   }
 
   private async buildAgentPolicy(
@@ -1275,14 +1279,14 @@ export class LiveDataDO {
       slot.total,
       reportBaseSec * AGENT_IDLE_INTERVAL_SPREAD_RATIO,
       mode === 'active' ? AGENT_ACTIVE_INTERVAL_SPREAD_MAX_SEC : AGENT_IDLE_INTERVAL_SPREAD_MAX_SEC,
-    ), mode !== 'active');
+    ));
     // Ping tasks inherit the same slot, so a fleet-wide identical interval can
     // never make every node probe and persist on the same tick.
     const pingIntervalSec = pingBaseSec + this.intervalSpreadSec(slot, this.intervalSpreadWindowSec(
       slot.total,
       pingBaseSec * AGENT_IDLE_INTERVAL_SPREAD_RATIO,
       AGENT_IDLE_INTERVAL_SPREAD_MAX_SEC,
-    ), true);
+    ));
     const pingTasks = this.pingTasksForClient(await this.getPingTasks(now), clientId, pingIntervalSec);
     const websiteProbeTasks = await this.getWebsiteProbeTasks(now, clientId);
     return {
